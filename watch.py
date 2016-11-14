@@ -27,7 +27,6 @@ def on_run(args):
     pir_active_px = (GPIO.PUD_DOWN if args.pir_active == True else GPIO.PUD_UP)
     video_extension = "avi"
     video_format = 'XVID'
-    min_detected_frame_count = args.min_time * args.framerate
     pre_num_frames = args.framerate * args.pre_trigger_video_length
     post_num_frames = args.framerate * args.post_trigger_video_length
     frame_stack = []
@@ -44,8 +43,7 @@ def on_run(args):
 
     print "Initializing OpenCV"
     base_frame = None
-    detected = False
-    detected_frame_count = 0
+    pir_detected = False
     video_frame_count = 1
 
     format = cv2.cv.CV_FOURCC(*video_format)
@@ -66,14 +64,14 @@ def on_run(args):
     try:
         while True:
             # Detected via gpio activation
-            if not detected:
+            if not pir_detected:
                 if GPIO.input(args.pir_gpio_num) == pir_active_state:
                     video_frame_count = 1
-                    detected = True
+                    pir_detected = True
                     video_name = generate_filename(video_extension)
                     video_path = os.path.join(args.video_path, video_name)
                     video_writer = cv2.VideoWriter(video_path, format, args.framerate, (args.xres, args.yres))
-                    print "GPIO Activated: " + video_path
+                    print "PIR Object Detected: " + video_path
 
             try:
                 frame = grabber_frame_queue.get(block=True, timeout=0.01)
@@ -84,65 +82,48 @@ def on_run(args):
                 cv2.imshow("Security Feed", frame)
 
             objects_in_frame = 0
+            thresh = None
+            frame_delta = None
 
             # Resize the frame, convert it to grayscale, and blur it
-            if args.threshold:
+            if args.threshold and pir_detected:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 if args.blur:
                     gray = cv2.GaussianBlur(gray, (args.blur, args.blur), 0)
 
                 # Base frame
                 time_diff = time.time() - last_rebase_timestamp
-                if base_frame is None or (detected == False and time_diff > args.rebase_period):
+                if base_frame is None or time_diff > args.rebase_period:
                     base_frame = gray
                     last_rebase_timestamp = time.time()
                     print "Getting a new base frame"
-                    continue
+                else:
+                    # Compute the absolute difference between the current frame and
+                    # first frame
+                    frame_delta = cv2.absdiff(base_frame, gray)
+                    thresh = cv2.threshold(frame_delta, args.threshold, 255, cv2.THRESH_BINARY)[1]
 
-                # Compute the absolute difference between the current frame and
-                # first frame
-                frame_delta = cv2.absdiff(base_frame, gray)
-                thresh = cv2.threshold(frame_delta, args.threshold, 255, cv2.THRESH_BINARY)[1]
+                    # Dilate the thresholded image to fill in holes, then find contours
+                    # on thresholded image
+                    thresh = cv2.dilate(thresh, None, iterations=2)
+                    (cnts, _) = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL,
+                        cv2.CHAIN_APPROX_SIMPLE)
 
-                # Dilate the thresholded image to fill in holes, then find contours
-                # on thresholded image
-                thresh = cv2.dilate(thresh, None, iterations=2)
-                (cnts, _) = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL,
-                    cv2.CHAIN_APPROX_SIMPLE)
+                    # Loop over the contours
+                    for c in cnts:
+                        # If the contour is too small, ignore it
+                        if cv2.contourArea(c) < args.min_area:
+                            continue
 
-                # Loop over the contours
-                for c in cnts:
-                    # If the contour is too small, ignore it
-                    if cv2.contourArea(c) < args.min_area:
-                        continue
+                        objects_in_frame += 1
 
-                    objects_in_frame += 1
+                        if args.object_highlight:
+                            # Compute the bounding box for the contour, draw it on the frame,
+                            # and update the text
+                            (x, y, w, h) = cv2.boundingRect(c)
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    print "Objects in Frame: " + str(objects_in_frame)
 
-                    # Compute the bounding box for the contour, draw it on the frame,
-                    # and update the text
-                    (x, y, w, h) = cv2.boundingRect(c)
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            else:
-                thresh = None
-                frame_delta = None
-
-
-            print "Objects in Frame: " + str(objects_in_frame)
-            print "Consecutive Frames Detected in: " + str(detected_frame_count)
-            if objects_in_frame >= 1:
-                detected_frame_count += 1
-            else:
-                detected_frame_count = 0
-
-            if detected_frame_count > min_detected_frame_count:
-                # Detected object on the camera
-                if not detected:
-                    video_frame_count = 1
-                    detected = True
-                    video_name = generate_filename(video_extension)
-                    video_path = os.path.join(args.video_path, video_name)
-                    video_writer = cv2.VideoWriter(video_path, format, args.framerate, (args.xres, args.yres))
-                    print "Object(s) Detected: #" + str(objects_in_frame) + ", vid path: " + video_path
 
             try:
                 server_frame_queue.get_nowait()
@@ -155,7 +136,7 @@ def on_run(args):
             print "Memory Usage: " + str(memory_usage_resource()) + "MB"
 
             # Once detected, record into a video stream and send via Pushbullet
-            if detected == True:
+            if pir_detected == True:
                 if len(frame_stack) > 0:
                     f = frame_stack.pop()
                     video_writer.write(f)
@@ -165,8 +146,7 @@ def on_run(args):
                     video_required_frames = pre_num_frames + post_num_frames
                     print "Video Frames: " + str(video_frame_count) + ", Needed: " + str(video_required_frames)
                     if video_frame_count > video_required_frames:
-                        detected_frame_count = 0
-                        detected = False
+                        pir_detected = False
 
                         del video_writer
 
@@ -200,8 +180,8 @@ parser.add_argument('-pir_gpio_num', help='GPIO channel (BCM mode) for PIR senso
 parser.add_argument('-pir_active_high', help='Active high for when the capture should begin.', dest='pir_active', required=False, action='store_true')
 parser.add_argument('-pir_active_low', help='Active low for when the capture should begin.', dest='pir_active', required=False, action='store_false')
 parser.add_argument('-video_path', help='Local path to save videos.', required=True)
+parser.add_argument('-object_highlight', help='Enable object highlighting on detection', dest='object_highlight', required=False, action='store_true')
 parser.add_argument('-min_area', help='Minimum area to detect.', type=int, required=True)
-parser.add_argument('-min_time', help='Minimum time an object has to be detected for.', type=int, required=True)
 parser.add_argument('-threshold', help='Threshold to a person.', type=int, required=False)
 parser.add_argument('-blur', help='Size of blur to apply to each frame.', type=int, required=False)
 parser.add_argument('-rebase_period', help='Frequency in seconds to update our base frame (providing the system isnt in the middle of a detection).', type=int, required=True)
